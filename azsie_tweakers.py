@@ -53,7 +53,7 @@ import urllib.error
 import urllib.request
 import winreg
 from datetime import datetime
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
@@ -76,7 +76,6 @@ DANGER = "#DC2626"
 DANGER_HOVER = "#B91C1C"
 BOOST = "#10B981"          # ปุ่ม One-Click Boost (เขียวมรกต สว่าง น่ากด)
 BOOST_HOVER = "#34D399"
-BOOST_BUSY = "#2B4A3F"
 DISCORD = "#5865F2"
 DISCORD_HOVER = "#4752C4"
 SIDEBAR_W = 240
@@ -513,6 +512,238 @@ class SmoothScrollFrame(ctk.CTkScrollableFrame):
             self._ss_job = None
 
 
+# ----------------------------------------------------------------------
+#  One-Click Boost dial (วาดด้วย Pillow เพื่อให้ขอบเรียบ มี glow และวงโปรเกรส)
+# ----------------------------------------------------------------------
+_PIL_FONTS = {}
+
+
+def _pil_font(size: int):
+    """ฟอนต์ตัวหนาสำหรับวาดตัวอักษรภาษาอังกฤษ/ตัวเลขบนปุ่มวงกลม (มี fallback)"""
+    size = max(int(size), 6)
+    if size in _PIL_FONTS:
+        return _PIL_FONTS[size]
+    win_fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    font = None
+    for cand in (os.path.join(win_fonts, "segoeuib.ttf"), os.path.join(win_fonts, "arialbd.ttf"),
+                 "segoeuib.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf"):
+        try:
+            font = ImageFont.truetype(cand, size)
+            break
+        except OSError:
+            continue
+    if font is None:
+        try:
+            font = ImageFont.load_default(size)   # Pillow 10.1+ รองรับกำหนดขนาด
+        except TypeError:
+            font = ImageFont.load_default()
+    _PIL_FONTS[size] = font
+    return font
+
+
+def _draw_centered(d, xy, text, font, fill):
+    try:
+        d.text(xy, text, font=font, fill=fill, anchor="mm")
+    except (ValueError, TypeError):  # ฟอนต์ที่ไม่รองรับ anchor
+        w, h = d.textbbox((0, 0), text, font=font)[2:]
+        d.text((xy[0] - w / 2, xy[1] - h / 2), text, font=font, fill=fill)
+
+
+def _mix(c1: str, c2: str, k: float) -> str:
+    a, b = _hex_to_rgb(c1), _hex_to_rgb(c2)
+    return _rgb_to_hex(tuple(x + (y - x) * k for x, y in zip(a, b)))
+
+
+class BoostDial(ctk.CTkLabel):
+    """ปุ่มวงกลม One-Click Boost: มี glow เต้นเบา ๆ, วงสแกนหมุนตอนว่าง,
+    วงโปรเกรส + เปอร์เซ็นต์ตอนทำงาน และเครื่องหมายถูกเมื่อเสร็จ"""
+
+    HIDPI = 2   # ภาพละเอียดเป็น 2 เท่าของขนาดที่แสดง (คมบนจอ HiDPI)
+    SS = 2      # supersampling เพื่อให้ขอบเรียบ
+
+    def __init__(self, master, size=250, command=None):
+        super().__init__(master, text="", width=size, height=size, fg_color="transparent")
+        self.size = size
+        self._command = command
+        self.state = "idle"          # idle | busy | done
+        self.progress = 0.0          # ค่าที่แสดงอยู่ (เคลื่อนเข้าหา target แบบนุ่ม ๆ)
+        self.target = 0.0
+        self._phase = 0.0
+        self._rot = 0.0
+        self._hover = 0.0
+        self._hover_target = 0.0
+        self._glow_cache = {}
+        self._disc_cache = {}
+        blank = Image.new("RGBA", (size * self.HIDPI, size * self.HIDPI), (0, 0, 0, 0))
+        self._ctk_img = ctk.CTkImage(light_image=blank, dark_image=blank, size=(size, size))
+        self.configure(image=self._ctk_img)
+        for w in (getattr(self, "_label", None), getattr(self, "_canvas", None)):
+            try:
+                w.configure(cursor="hand2")
+            except Exception:
+                pass
+        self.bind("<Enter>", lambda _e: self._set_hover(1.0))
+        self.bind("<Leave>", lambda _e: self._set_hover(0.0))
+        self.bind("<Button-1>", self._on_click)
+        self._render()
+
+    # ---- public API ---------------------------------------------------
+    def begin(self):
+        self.state, self.progress, self.target = "busy", 0.0, 0.03
+
+    def set_target(self, p: float):
+        self.target = max(0.0, min(1.0, p))
+
+    def finish(self):
+        self.state, self.target = "done", 1.0
+
+    def set_busy(self, busy: bool):
+        if busy and self.state != "busy":
+            self.begin()
+        elif not busy and self.state == "busy":
+            self.state = "idle"
+            self.progress = self.target = 0.0
+
+    # ---- interaction --------------------------------------------------
+    def _set_hover(self, v: float):
+        self._hover_target = 0.0 if self.state == "busy" else v
+
+    def _on_click(self, e):
+        if self.state == "busy" or not self._command:
+            return
+        r = self.size / 2
+        if math.hypot(e.x - r, e.y - r) <= self.size * 0.46:
+            self._command()
+
+    # ---- animation ----------------------------------------------------
+    def tick(self, dt: float):
+        dt = max(0.0, min(dt, 0.1))
+        self._phase += dt * (3.4 if self.state == "busy" else 2.2)
+        self._rot = (self._rot + dt * (260 if self.state == "busy" else 110)) % 360
+        self._hover += (self._hover_target - self._hover) * min(1.0, dt * 12)
+        self.progress += (self.target - self.progress) * min(1.0, dt * 4)
+        self._render()
+
+    # ---- drawing ------------------------------------------------------
+    def _glow(self, F: int, color: str):
+        """glow ที่ความละเอียดสุดท้าย (เบลอครั้งเดียวแล้วแคชไว้)"""
+        key = (F, color)
+        if key not in self._glow_cache:
+            u = F / 250.0
+            layer = Image.new("RGBA", (F, F), _hex_to_rgb(color) + (0,))
+            ImageDraw.Draw(layer).ellipse(
+                (F / 2 - 90 * u, F / 2 - 90 * u, F / 2 + 90 * u, F / 2 + 90 * u),
+                fill=_hex_to_rgb(color) + (255,))
+            self._glow_cache[key] = layer.filter(ImageFilter.GaussianBlur(14 * u))
+        return self._glow_cache[key]
+
+    def _disc(self, F: int, outer: str, inner: str, radius_u: float):
+        """แผ่นกลางไล่สี วาดแบบ supersample แล้วย่อ แคชไว้ตามสี"""
+        key = (F, outer, inner, round(radius_u, 1))
+        if key not in self._disc_cache:
+            S = F * self.SS
+            u = S / 250.0
+            c = S / 2
+            layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+            d = ImageDraw.Draw(layer)
+            steps = 28
+            for i in range(steps):
+                t = i / (steps - 1)
+                r = radius_u * u * (1 - 0.55 * t)
+                cy = c - radius_u * u * 0.22 * t
+                d.ellipse((c - r, cy - r, c + r, cy + r), fill=_mix(outer, inner, t ** 0.8))
+            if len(self._disc_cache) > 40:
+                self._disc_cache.clear()
+            self._disc_cache[key] = layer.reduce(self.SS)
+        return self._disc_cache[key]
+
+    def _render(self):
+        F = self.size * self.HIDPI          # ขนาดภาพสุดท้าย (px)
+        S = F * self.SS                     # ขนาดชั้นวาดเส้น (supersample)
+        u = S / 250.0
+        c = S / 2
+        pulse = (math.sin(self._phase) + 1) / 2
+        busy, done = self.state == "busy", self.state == "done"
+        hv = round(self._hover * 4) / 4
+
+        # ชั้นล่าง: glow + แผ่นกลาง (ทำที่ความละเอียดสุดท้ายเพื่อให้เร็ว)
+        k = (0.55 + 0.25 * pulse) if busy else (0.50 + 0.30 * pulse + 0.25 * hv)
+        glow = self._glow(F, BOOST)
+        a = glow.getchannel("A").point(lambda v, k=k: int(v * k))
+        img = glow.copy()
+        img.putalpha(a)
+        if busy:
+            outer, inner = "#13261F", "#24443A"
+        else:
+            outer = _mix("#047857", "#10B981", hv)
+            inner = _mix("#34D399", "#86EFAC", hv)
+        disc_r = 80 * (1 + 0.03 * hv)
+        img.alpha_composite(self._disc(F, outer, inner, disc_r))
+
+        # ชั้นบน: วงแหวน ไอคอน ตัวอักษร (supersample)
+        layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        ring_r, ring_w = 100 * u, max(int(7 * u), 2)
+        box = (c - ring_r, c - ring_r, c + ring_r, c + ring_r)
+        mid_r = ring_r - ring_w / 2          # PIL วาดเส้นหนาเข้าด้านในของกรอบ
+
+        def tip(angle_deg, fill):
+            x = c + mid_r * math.cos(math.radians(angle_deg))
+            y = c + mid_r * math.sin(math.radians(angle_deg))
+            rr = ring_w / 2
+            d.ellipse((x - rr, y - rr, x + rr, y + rr), fill=fill)
+
+        # วงราง
+        d.ellipse(box, outline=_mix(PANEL_2, BOOST, 0.16 if not (busy or done) else 0.08), width=ring_w)
+        if busy or done:
+            p = max(self.progress, 0.012)
+            start, end = -90, -90 + 360 * min(p, 1.0)
+            if p >= 0.999:
+                d.ellipse(box, outline=BOOST, width=ring_w)
+            else:
+                d.arc(box, start, end, fill=BOOST, width=ring_w)
+                tip(start, BOOST)
+                tip(end, "#A7F3D0")
+            if busy:  # แสงวิ่งบนวง
+                sweep = (self._rot % 360) - 90
+                d.arc(box, sweep, sweep + 26, fill=_mix(BOOST, "#FFFFFF", 0.55), width=max(ring_w - int(2 * u), 2))
+        else:
+            seg_start = self._rot - 90
+            d.arc(box, seg_start, seg_start + 78, fill=_mix(BOOST, "#FFFFFF", 0.10 + 0.25 * pulse), width=ring_w)
+            tip(seg_start, BOOST)
+            tip(seg_start + 78, BOOST)
+
+        rr = disc_r * u
+        d.ellipse((c - rr, c - rr, c + rr, c + rr), outline=_mix(outer, "#FFFFFF", 0.18), width=max(int(1.5 * u), 1))
+
+        dark, light = "#04150E", "#E8FFF6"
+        if busy:
+            _draw_centered(d, (c, c - 6 * u), f"{int(round(self.progress * 100))}%",
+                           _pil_font(int(44 * u)), light)
+            _draw_centered(d, (c, c + 30 * u), "BOOSTING", _pil_font(int(12 * u)), _mix(BOOST, "#FFFFFF", 0.35))
+        elif done:
+            w = max(int(9 * u), 3)
+            pts = [(c - 27 * u, c - 6 * u), (c - 9 * u, c + 12 * u), (c + 28 * u, c - 26 * u)]
+            d.line(pts, fill=dark, width=w, joint="curve")
+            for x, y in (pts[0], pts[-1]):
+                d.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill=dark)
+            _draw_centered(d, (c, c + 36 * u), "DONE", _pil_font(int(16 * u)), dark)
+        else:
+            iy, ir, w = c - 14 * u, 25 * u, max(int(6.5 * u), 3)
+            d.arc((c - ir, iy - ir, c + ir, iy + ir), -55, 235, fill=dark, width=w)
+            for ang in (-55, 235):
+                x = c + (ir - w / 2) * math.cos(math.radians(ang))
+                y = iy + (ir - w / 2) * math.sin(math.radians(ang))
+                d.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill=dark)
+            d.line((c, iy - ir - 4 * u, c, iy - 2 * u), fill=dark, width=w)
+            d.ellipse((c - w / 2, iy - ir - 4 * u - w / 2, c + w / 2, iy - ir - 4 * u + w / 2), fill=dark)
+            _draw_centered(d, (c, c + 38 * u), "BOOST", _pil_font(int(19 * u)), dark)
+
+        img.alpha_composite(layer.reduce(self.SS))
+        self._ctk_img.configure(light_image=img, dark_image=img)
+
+
+
 # ======================================================================
 #  Content definitions (TH, EN)
 # ======================================================================
@@ -534,7 +765,8 @@ PAGE_SUB = {
             "Deeper Windows tuning for performance, lower latency and privacy"),
     "short": ("ทางลัดไปยังหน้าตั้งค่าที่ใช้ปิดสิ่งที่ทำให้เครื่องช้า",
               "Shortcuts to the Windows pages where you can switch off what slows your PC"),
-    "boost": ("กดปุ่มเดียว ปรับแต่งอัตโนมัติ", "One button, fully automatic"),
+    "boost": ("เลือกโปรไฟล์ แล้วกดปุ่มเดียว ปรับแต่งอัตโนมัติ พร้อมดูความคืบหน้าแบบสด",
+              "Pick a profile, press one button, watch every step run live"),
     "info": ("ข้อมูลโปรแกรมและลิงก์ชุมชน", "About this tool and community links"),
 }
 
@@ -560,6 +792,17 @@ BASIC_CLEANUP = [
      ("ลบ Minidump, MEMORY.DMP, CrashDumps และรายงานของ Windows Error Reporting",
       "Delete Minidump, MEMORY.DMP, CrashDumps and Windows Error Reporting files"),
      "task_crash_dumps"),
+    (("ล้างแคช Shader ของเกม/การ์ดจอ", "Clear Shader Caches (GPU / Games)"),
+     ("ลบแคช Shader ของ DirectX, NVIDIA, AMD และ Intel ที่สะสมจนบวม (เกมจะสร้างใหม่เอง "
+      "การเปิดเกมครั้งแรกหลังล้างอาจกระตุกเล็กน้อย)",
+      "Delete bloated DirectX, NVIDIA, AMD and Intel shader caches (games rebuild them; "
+      "the first launch afterwards may stutter a little)"),
+     "task_shader_cache"),
+    (("ล้างบันทึกระบบและแคช Delivery Optimization", "Clear System Logs & Delivery Optimization Cache"),
+     ("ลบ log ของ CBS/DISM/Windows Update และแคชไฟล์อัปเดตที่แชร์ให้เครื่องอื่น (ไฟล์ที่ระบบใช้งานอยู่จะถูกข้าม)",
+      "Delete CBS/DISM/Windows Update logs and the cached update files shared with other PCs "
+      "(files in use are skipped)"),
+     "task_sys_logs"),
     (("ล้างถังขยะ", "Empty Recycle Bin"),
      ("ลบไฟล์ทั้งหมดในถังขยะของทุกไดรฟ์ (กู้คืนไม่ได้)",
       "Permanently delete everything in the Recycle Bin on all drives"),
@@ -571,6 +814,11 @@ BASIC_SYSTEM = [
      ("ล้าง RAM Standby List และเคลียร์ Memory Working Set",
       "Clear the RAM Standby List and trim process Working Sets"),
      "task_optimize_ram"),
+    (("ปรับแต่ง SSD (TRIM)", "Optimize SSD (TRIM)"),
+     ("ตรวจว่าไดรฟ์ระบบเป็น SSD หรือไม่ ถ้าใช่จะสั่ง ReTrim เพื่อคืนบล็อกที่ว่างให้ SSD (HDD จะถูกข้ามอัตโนมัติ)",
+      "Check whether the system drive is an SSD and, if so, run ReTrim so free blocks are returned to it "
+      "(HDDs are skipped automatically)"),
+     "task_retrim"),
     (("ล้าง DNS และรีเซ็ตเครือข่าย", "Flush DNS & Reset Network"),
      ("ipconfig /flushdns, netsh winsock reset, netsh int ip reset (ต้องรีสตาร์ทเครื่อง)",
       "ipconfig /flushdns, netsh winsock reset, netsh int ip reset (restart required)"),
@@ -627,6 +875,62 @@ ADVANCED_GROUPS = [
          ("bcdedit /deletevalue useplatformclock ลดความหน่วงเมาส์/คีย์บอร์ด (ต้องรีสตาร์ทเครื่อง)",
           "bcdedit /deletevalue useplatformclock to reduce mouse/keyboard latency (restart required)"),
          "task_hpet"),
+        (("ปิด Power Throttling", "Disable Power Throttling"),
+         ("ตั้ง PowerThrottlingOff = 1 ไม่ให้ Windows หน่วงความเร็วโปรเซสเบื้องหลัง/เกมเพื่อประหยัดไฟ "
+          "(โน้ตบุ๊กอาจกินแบตมากขึ้น ต้องรีสตาร์ทเครื่อง)",
+          "Set PowerThrottlingOff = 1 so Windows stops slowing background processes and games to save power "
+          "(laptops may use more battery; restart required)"),
+         "task_power_throttle"),
+        (("เพิ่มลำดับความสำคัญให้โปรแกรมที่ใช้งานอยู่", "Boost Foreground App Priority"),
+         ("ตั้ง Win32PrioritySeparation = 0x26 ให้โปรแกรม/เกมที่อยู่หน้าจอได้เวลา CPU มากขึ้น ตอบสนองไวขึ้น "
+          "(ต้องรีสตาร์ทเครื่อง)",
+          "Set Win32PrioritySeparation = 0x26 so the app or game in front gets more CPU time and responds faster "
+          "(restart required)"),
+         "task_priority_sep"),
+        (("ตั้ง MMCSS ให้เกมได้ทรัพยากรสูงสุด", "Give Games Top MMCSS Priority"),
+         ("ปรับ Tasks\\Games ใน MMCSS: GPU Priority 8, Priority 6, Scheduling Category High, SFIO Priority High "
+          "(ต้องรีสตาร์ทเครื่อง)",
+          "Tune the MMCSS Tasks\\Games profile: GPU Priority 8, Priority 6, Scheduling Category High, "
+          "SFIO Priority High (restart required)"),
+         "task_mmcss_games"),
+        (("ปิด Nagle Algorithm (ลด Ping)", "Disable Nagle's Algorithm (Lower Ping)"),
+         ("ตั้ง TcpAckFrequency = 1 และ TCPNoDelay = 1 กับการ์ดเครือข่ายที่ใช้งานอยู่ ลดหน่วงของแพ็กเก็ตเล็กในเกมออนไลน์ "
+          "(ต้องรีสตาร์ทเครื่อง)",
+          "Set TcpAckFrequency = 1 and TCPNoDelay = 1 on active network adapters to cut small-packet delay in "
+          "online games (restart required)"),
+         "task_nagle"),
+        (("เปิด Game Mode", "Enable Game Mode"),
+         ("เปิด Game Mode ของ Windows ให้จัดลำดับทรัพยากรให้เกมที่กำลังเล่นและลดการแย่ง CPU จากงานเบื้องหลัง",
+          "Turn on Windows Game Mode so the game you are playing gets priority over background work"),
+         "task_game_mode"),
+        (("ลดความหน่วง UI และ Startup Delay", "Faster UI & No Startup Delay"),
+         ("ตั้ง MenuShowDelay = 0 และลบ Startup delay ของโปรแกรมที่เปิดตอนเข้า Windows ให้เดสก์ท็อปพร้อมใช้เร็วขึ้น "
+          "(ออกจากระบบแล้วเข้าใหม่เพื่อให้มีผล)",
+          "Set MenuShowDelay = 0 and remove the startup-app delay so the desktop is ready sooner "
+          "(sign out and in for it to apply)"),
+         "task_ui_delay"),
+        (("ปิดเครื่องเร็วขึ้น", "Faster Shutdown"),
+         ("ลดเวลารอปิดบริการและโปรแกรมตอน Shutdown (WaitToKillServiceTimeout 3 วินาที, WaitToKillAppTimeout 5 วินาที, "
+          "HungAppTimeout 3 วินาที)",
+          "Shorten how long Windows waits for services and apps on shutdown (WaitToKillServiceTimeout 3 s, "
+          "WaitToKillAppTimeout 5 s, HungAppTimeout 3 s)"),
+         "task_fast_shutdown"),
+        (("ปิด Hibernate (คืนพื้นที่ hiberfil.sys)", "Disable Hibernate (Free hiberfil.sys)"),
+         ("powercfg /h off ลบไฟล์ hiberfil.sys ที่กินพื้นที่หลาย GB และปิด Fast Startup/Hibernate "
+          "เปิดกลับได้จากปุ่ม \"เปิด Hibernate กลับ\"",
+          "powercfg /h off removes the multi-GB hiberfil.sys and turns off Fast Startup/Hibernate. "
+          "Undo it with the \"Re-enable Hibernate\" button"),
+         "task_hibernate_off",
+         {"confirm": (
+             "ปิด Hibernate หรือไม่?\n\nจะลบ hiberfil.sys และปิด Fast Startup ด้วย "
+             "เครื่องอาจบูตช้าลงเล็กน้อยบน HDD แต่ได้พื้นที่ดิสก์คืนหลาย GB",
+             "Disable Hibernate?\n\nThis deletes hiberfil.sys and also turns off Fast Startup. "
+             "Boot may be slightly slower on an HDD, but you get several GB of disk space back."),
+          "btn": ("ปิด", "DISABLE")}),
+        (("เปิด Hibernate กลับ", "Re-enable Hibernate"),
+         ("powercfg /h on สร้าง hiberfil.sys และเปิด Hibernate/Fast Startup กลับมา",
+          "powercfg /h on recreates hiberfil.sys and brings Hibernate/Fast Startup back"),
+         "task_hibernate_on"),
     ]),
     (("ความเป็นส่วนตัวและหน้าตา", "Privacy & Interface"), [
         (("ปิดบริการ Telemetry", "Disable Telemetry Services"),
@@ -640,6 +944,22 @@ ADVANCED_GROUPS = [
           "Turn off Widgets/News, suggested apps, the Recommended section and Start Menu ads plus "
           "Windows tips (some values are locked on newer builds; sign out and in for full effect)"),
          "task_start_clean"),
+        (("ปิด Activity History และการติดตามภาษา", "Disable Activity History & Language Tracking"),
+         ("ปิดการเก็บและอัปโหลดประวัติกิจกรรม (Timeline) และไม่ส่งรายการภาษาให้เว็บไซต์ "
+          "(ออกจากระบบแล้วเข้าใหม่เพื่อให้มีผลครบ)",
+          "Stop collecting and uploading Activity History (Timeline) and stop sharing your language list "
+          "with websites (sign out and in for full effect)"),
+         "task_activity_history"),
+        (("ปิดการค้นหาเว็บ (Bing) ใน Start Menu", "Disable Web (Bing) Search in Start Menu"),
+         ("ให้ช่องค้นหาของ Start ค้นเฉพาะในเครื่อง ไม่ส่งคำค้นไปที่ Bing ทำให้ผลลัพธ์ขึ้นไวกว่าเดิม",
+          "Make Start search look only on this PC instead of sending queries to Bing, so results appear faster"),
+         "task_bing_search"),
+        (("ปิดแอปเบื้องหลังของ Microsoft Store", "Turn Off Store Apps Running in Background"),
+         ("ตั้ง GlobalUserDisabled = 1 ไม่ให้แอป Store แอบรันเบื้องหลัง ลดการกิน RAM/CPU/เน็ต "
+          "(การแจ้งเตือนของแอปบางตัวอาจช้าลง เปิดกลับได้ที่หน้า Background Apps)",
+          "Set GlobalUserDisabled = 1 so Store apps stop running in the background, saving RAM/CPU/network "
+          "(notifications of some apps may be delayed; undo on the Background Apps page)"),
+         "task_bg_apps"),
     ]),
     (("ตั้งค่าแยกรายโปรแกรม", "Per-App Settings"), [
         (("ปิด Fullscreen Optimizations ต่อเกม", "Disable Fullscreen Optimizations (per game)"),
@@ -708,6 +1028,57 @@ ADVANCED_GROUPS = [
     ]),
 ]
 
+
+# ขั้นตอนที่ One-Click Boost เลือกใช้ได้: key -> (ชื่อ TH/EN, ชื่อเมธอด)
+BOOST_STEPS = {
+    "restore": (("จุดคืนค่าระบบ", "Restore Point"), "task_restore_point"),
+    "junk": (("ล้างไฟล์ขยะ", "Junk Files"), "task_clean_junk"),
+    "update_cache": (("แคช Windows Update", "Windows Update Cache"), "task_update_cache"),
+    "browser": (("แคชเบราว์เซอร์", "Browser Caches"), "task_browser_cache"),
+    "thumbs": (("แคชรูปย่อและไอคอน", "Thumbnail & Icon Cache"), "task_thumbnails"),
+    "dumps": (("Crash Dump", "Crash Dumps"), "task_crash_dumps"),
+    "logs": (("บันทึกระบบและแคชอัปเดต", "System Logs & Delivery Cache"), "task_sys_logs"),
+    "recycle": (("ถังขยะ", "Recycle Bin"), "task_recycle_bin"),
+    "ram": (("ล้างแคช RAM", "RAM Cache"), "task_optimize_ram"),
+    "network": (("รีเซ็ตเครือข่าย", "Network Reset"), "task_network"),
+    "power": (("Ultimate Performance", "Ultimate Performance"), "task_ultimate_power"),
+    "power_throttle": (("ปิด Power Throttling", "No Power Throttling"), "task_power_throttle"),
+    "priority": (("ลำดับความสำคัญแอปหน้าจอ", "Foreground Priority"), "task_priority_sep"),
+    "mmcss": (("MMCSS สำหรับเกม", "MMCSS Game Profile"), "task_mmcss_games"),
+    "game_mode": (("เปิด Game Mode", "Enable Game Mode"), "task_game_mode"),
+    "telemetry": (("ปิด Telemetry", "Disable Telemetry"), "task_telemetry"),
+    "gamebar": (("ปิด Game Bar และ DVR", "Disable Game Bar & DVR"), "task_gamebar"),
+    "hpet": (("ปิด HPET", "Disable HPET"), "task_hpet"),
+    "net_throttle": (("ปิด Network Throttling", "No Network Throttling"), "task_net_throttle"),
+    "nagle": (("ปิด Nagle (ลด Ping)", "Disable Nagle (Lower Ping)"), "task_nagle"),
+    "ui_delay": (("ลดหน่วง UI / Startup", "Faster UI / Startup"), "task_ui_delay"),
+    "retrim": (("TRIM สำหรับ SSD", "SSD TRIM"), "task_retrim"),
+}
+
+# ขั้นตอนที่ต้องรีสตาร์ท/ออกจากระบบเพื่อให้มีผลครบ
+BOOST_NEEDS_RESTART = {"network", "power_throttle", "priority", "mmcss", "hpet", "net_throttle", "nagle"}
+
+# โปรไฟล์: (key, ชื่อ, คำอธิบายสั้น, รายการขั้นตอนตามลำดับ)
+# ไม่มีโปรไฟล์ไหนปิด Windows Defender หรือ Windows Update (ต้องสั่งเองที่หน้า Advanced เท่านั้น)
+BOOST_PROFILES = [
+    ("quick", ("เร็ว", "Quick"),
+     ("ล้างไฟล์ขยะ แคช และ RAM ไม่แก้ค่าระบบเชิงลึก ใช้เวลาไม่นาน",
+      "Cleans junk, caches and RAM without deeper system changes. Takes the least time"),
+     ["restore", "junk", "update_cache", "browser", "thumbs", "dumps", "logs", "recycle", "ram"]),
+    ("gaming", ("เกมมิ่ง", "Gaming"),
+     ("เน้นลดหน่วงและเพิ่มความลื่นตอนเล่นเกม: แผนพลังงาน, ลำดับความสำคัญ, MMCSS, Nagle, Game Mode",
+      "Focused on lower latency and smoother play: power plan, priorities, MMCSS, Nagle, Game Mode"),
+     ["restore", "ram", "power", "power_throttle", "priority", "mmcss", "game_mode", "gamebar",
+      "net_throttle", "nagle", "hpet"]),
+    ("full", ("เต็มรูปแบบ", "Ultimate"),
+     ("ทุกอย่างรวมกัน: ล้างเครื่องทั้งหมด + ปรับแต่งเกมมิ่ง + ความเป็นส่วนตัว + TRIM SSD (ไม่รวม DISM และ SFC)",
+      "Everything combined: full cleanup + gaming tuning + privacy + SSD TRIM (DISM and SFC excluded)"),
+     ["restore", "junk", "update_cache", "browser", "thumbs", "dumps", "logs", "recycle", "ram",
+      "network", "power", "power_throttle", "priority", "mmcss", "game_mode", "telemetry", "gamebar",
+      "hpet", "net_throttle", "nagle", "ui_delay", "retrim"]),
+]
+BOOST_PROFILE_MAP = {p[0]: p for p in BOOST_PROFILES}
+BOOST_DEFAULT_PROFILE = "full"
 
 # กลุ่มทางลัด: (ชื่อกลุ่ม TH, EN, [ (ชื่อ, คำอธิบาย TH, EN, target) ])
 SHORTCUT_GROUPS = [
@@ -799,7 +1170,10 @@ class AzsieTweaker(ctk.CTk):
         self._set_window_icon()
 
         self.sys_drive = os.environ.get("SystemDrive", "C:")
-        self._pulse_t = 0.0
+        self._boost_last_tick = time.time()
+        self._boost_tracking = False   # ระหว่างรันขั้นตอนของ Boost: จดว่ามี log ระดับ err หรือไม่
+        self._boost_err = False
+        self._freed_total = 0          # ไบต์ที่ล้างได้สะสม (ใช้สรุปผลหลัง Boost)
         self._dl = self._load_dl_cache()
         self._upd_info = {"state": "idle", "tag": "", "url": "", "error": None}
         self._gpu_names = []
@@ -859,6 +1233,7 @@ class AzsieTweaker(ctk.CTk):
         self._update_status()
         self._render_downloads()
         self._render_update()
+        self._refresh_boost_texts()
 
     def on_lang_change(self, value):
         global LANG
@@ -1029,29 +1404,7 @@ class AzsieTweaker(ctk.CTk):
 
         # --- Boost
         boost = make_page("boost")
-        info = ctk.CTkLabel(boost, text="", font=ctk.CTkFont(family="Segoe UI", size=13),
-                            text_color=SUBTEXT, justify="center", wraplength=520)
-        self.tr(info, lambda: L(
-            "รันตามลำดับอัตโนมัติ: จุดคืนค่าระบบ, ล้างไฟล์ขยะ, ล้างแคช Windows Update และเบราว์เซอร์, "
-            "ล้างรูปย่อ/Crash Dump/ถังขยะ, ล้าง RAM, รีเซ็ตเครือข่าย, Ultimate Performance, "
-            "ปิด Telemetry, ปิด Game Bar/DVR และปิด HPET\n(ไม่รวม DISM และ SFC เพราะใช้เวลานาน)",
-            "Runs automatically in order: restore point, junk files, Windows Update and browser caches, "
-            "thumbnails / crash dumps / recycle bin, RAM, network reset, Ultimate Performance, "
-            "telemetry, Game Bar/DVR and HPET\n(DISM and SFC are excluded because they take a long time)"))
-        info.pack(pady=(26, 20), padx=14)
-        self.btn_boost = SmoothButton(
-            boost, text="[ RUN ULTIMATE BOOST NOW ]", height=96, corner_radius=18,
-            font=ctk.CTkFont(family="Segoe UI", size=26, weight="bold"),
-            fg_color=BOOST, hover_color=BOOST_HOVER, text_color="#04150E",
-            text_color_disabled="#A7C4B8", border_width=3, border_color="#047857",
-            command=self.on_boost_click,
-        )
-        self.btn_boost.pack(fill="x", padx=24)
-        self.action_buttons.append(self.btn_boost)
-        warn = ctk.CTkLabel(boost, text="", font=ctk.CTkFont(family="Segoe UI", size=12), text_color="#FBBF24")
-        self.tr(warn, lambda: L("แนะนำให้รีสตาร์ทเครื่องหลังเสร็จสิ้น เพื่อให้การปรับแต่งมีผลครบทุกส่วน",
-                                "Restart your PC afterwards so every change takes full effect"))
-        warn.pack(pady=16)
+        self._build_boost(boost)
 
         # --- Info
         info_page = make_page("info")
@@ -1472,21 +1825,329 @@ class AzsieTweaker(ctk.CTk):
             pass
         self.after(1500, self._tick_dashboard)
 
-    def _pulse_boost(self):
-        # วงขอบเรืองแสงเบา ๆ ที่ปุ่ม Boost ให้ดูน่ากด (ทำงานเฉพาะตอนเปิดหน้านี้)
+    # ------------------------------------------------------------------
+    # One-Click Boost page
+    # ------------------------------------------------------------------
+    def _build_boost(self, page):
+        saved = load_settings().get("boost_profile")
+        self.boost_profile = saved if saved in BOOST_PROFILE_MAP else BOOST_DEFAULT_PROFILE
+        self._boost_ui = {"mode": "idle", "idx": 0, "total": 0, "name": ""}
+        self._boost_rows = {}
+        self._boost_status = {}
+        self._boost_cards = {}
+        self._boost_summary_data = None
+
+        hero = ctk.CTkFrame(page, fg_color=PANEL_2, corner_radius=20, border_width=1, border_color=CARD_BORDER)
+        hero.pack(fill="x", padx=8, pady=(10, 6))
+        hero.grid_columnconfigure(0, weight=0, minsize=270)
+        hero.grid_columnconfigure(1, weight=1)
+        self.boost_hero = hero
+
+        # ซ้าย: ปุ่มวงกลม + สถานะ / ขวา: เลือกโปรไฟล์
+        left = ctk.CTkFrame(hero, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="n", padx=(18, 8), pady=(14, 14))
+        right = ctk.CTkFrame(hero, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=(14, 14))
+        right.grid_columnconfigure(0, weight=1)
+
+        self.boost_dial = BoostDial(left, size=220, command=self.on_boost_click)
+        self.boost_dial.pack()
+        self.boost_status = ctk.CTkLabel(left, text="", text_color=TEXT, wraplength=250, justify="center",
+                                         font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"))
+        self.boost_status.pack(pady=(2, 0))
+        self.boost_hint = ctk.CTkLabel(left, text="", text_color=SUBTEXT, justify="center", wraplength=250,
+                                       font=ctk.CTkFont(family="Segoe UI", size=11))
+        self.boost_hint.pack(pady=(2, 0))
+
+        cards_wrap = ctk.CTkFrame(right, fg_color="transparent")
+        cards_wrap.grid(row=0, column=0, sticky="nsew")
+        cards_wrap.grid_columnconfigure(0, weight=1)
+        self._boost_cards_wrap = cards_wrap
+        for row, (key, _name, _desc, _steps) in enumerate(BOOST_PROFILES):
+            self._make_profile_card(cards_wrap, row, key)
+        self.boost_last = ctk.CTkLabel(cards_wrap, text="", text_color="#64748B", anchor="w",
+                                       font=ctk.CTkFont(family="Segoe UI", size=11))
+        self.boost_last.grid(row=len(BOOST_PROFILES), column=0, sticky="w", padx=4, pady=(8, 0))
+
+        # ผลสรุปหลังบูสต์เสร็จ: แทนที่การ์ดโปรไฟล์ในกรอบเดียวกัน (เห็นทันทีโดยไม่ต้องเลื่อนหน้า)
+        sm = ctk.CTkFrame(right, fg_color=BADGE_BG, corner_radius=14, border_width=2, border_color="#0F5C45")
+        sm.grid(row=0, column=0, sticky="nsew")
+        sm.grid_remove()
+        sm.grid_columnconfigure((0, 1), weight=1, uniform="stat")
+        self.boost_summary = sm
+        self._sum_title = ctk.CTkLabel(sm, text="", anchor="w", text_color=BOOST,
+                                       font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"))
+        self.tr(self._sum_title, lambda: L("ผลการบูสต์", "Boost Result"))
+        self._sum_title.grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(10, 0))
+        self._sum_tiles = []
+        captions = (("เวลาที่ใช้", "Time"), ("พื้นที่ดิสก์ที่ล้างได้", "Disk freed"),
+                    ("RAM ว่างเพิ่ม", "RAM freed"), ("ขั้นตอนที่ทำได้", "Steps done"))
+        for i, cap in enumerate(captions):
+            tile = ctk.CTkFrame(sm, fg_color=PANEL_2, corner_radius=10)
+            tile.grid(row=1 + i // 2, column=i % 2, sticky="nsew",
+                      padx=(14 if i % 2 == 0 else 4, 4 if i % 2 == 0 else 14), pady=4)
+            val = ctk.CTkLabel(tile, text="-", text_color=TEXT,
+                               font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"))
+            val.pack(padx=8, pady=(6, 0))
+            cap_lbl = ctk.CTkLabel(tile, text="", text_color=SUBTEXT, font=ctk.CTkFont(family="Segoe UI", size=11))
+            self.tr(cap_lbl, lambda p=cap: L(*p))
+            cap_lbl.pack(padx=8, pady=(0, 6))
+            self._sum_tiles.append(val)
+        self._sum_restart = ctk.CTkFrame(sm, fg_color="transparent")
+        self._sum_restart.grid_columnconfigure(0, weight=1)
+        self._sum_restart_lbl = ctk.CTkLabel(self._sum_restart, text="", anchor="w", justify="left",
+                                             text_color="#FBBF24", wraplength=210,
+                                             font=ctk.CTkFont(family="Segoe UI", size=11))
+        self.tr(self._sum_restart_lbl, lambda: L("รีสตาร์ทเครื่องเพื่อให้มีผลครบ",
+                                                 "Restart so everything takes effect"))
+        self._sum_restart_lbl.grid(row=0, column=0, sticky="w")
+        self.btn_restart = SmoothButton(
+            self._sum_restart, text="", width=150, height=32, corner_radius=9,
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color=BOOST, hover_color=BOOST_HOVER, text_color="#04150E", command=self.restart_now)
+        self.tr(self.btn_restart, lambda: L("รีสตาร์ทตอนนี้", "RESTART NOW"))
+        self.btn_restart.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self.btn_back = SmoothButton(
+            sm, text="", height=28, corner_radius=8, font=ctk.CTkFont(family="Segoe UI", size=11),
+            fg_color=PANEL_2, hover_color=NAV_HOVER, command=self._boost_back)
+        self.tr(self.btn_back, lambda: L("เลือกโปรไฟล์อื่น", "Choose another profile"))
+        self.btn_back.grid(row=4, column=0, columnspan=2, sticky="ew", padx=14, pady=(4, 12))
+
+        # ---- รายการขั้นตอนของโปรไฟล์ที่เลือก
+        steps_card = ctk.CTkFrame(page, fg_color=PANEL_2, corner_radius=16, border_width=1, border_color=CARD_BORDER)
+        steps_card.pack(fill="x", padx=8, pady=6)
+        self._steps_title = ctk.CTkLabel(steps_card, text="", anchor="w", text_color=ACCENT,
+                                         font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"))
+        self.tr(self._steps_title, lambda: L("ขั้นตอนที่จะทำงาน", "Steps that will run"))
+        self._steps_title.pack(fill="x", padx=16, pady=(12, 2))
+        self.boost_steps_frame = ctk.CTkFrame(steps_card, fg_color="transparent")
+        self.boost_steps_frame.pack(fill="x", padx=12, pady=(0, 12))
+        self.boost_steps_frame.grid_columnconfigure((0, 1), weight=1, uniform="step")
+
+        warn = ctk.CTkLabel(page, text="", font=ctk.CTkFont(family="Segoe UI", size=12), text_color="#FBBF24",
+                            justify="center", wraplength=620)
+        self.tr(warn, lambda: L("ระบบจะสร้างจุดคืนค่าระบบให้ก่อนเสมอ และไม่มีโปรไฟล์ใดปิด Windows Defender หรือ Windows Update "
+                                "แนะนำให้รีสตาร์ทเครื่องหลังเสร็จสิ้น",
+                                "A restore point is always created first, and no profile disables Windows Defender "
+                                "or Windows Update. Restart your PC afterwards"))
+        warn.pack(pady=(8, 16))
+
+        self._render_boost_steps()
+        self._apply_profile_style()
+        self._update_boost_last()
+        self._refresh_boost_texts()
+
+    def _make_profile_card(self, parent, row, key):
+        _k, name, desc, steps = BOOST_PROFILE_MAP[key]
+        card = ctk.CTkFrame(parent, fg_color=BADGE_BG, corner_radius=14, border_width=2, border_color=CARD_BORDER)
+        card.grid(row=row, column=0, sticky="ew", pady=(0 if row == 0 else 6, 0))
+        card.grid_columnconfigure(0, weight=1)
+        title = ctk.CTkLabel(card, text="", anchor="w", text_color=TEXT,
+                             font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"))
+        count = ctk.CTkLabel(card, text="", anchor="e", text_color=BOOST,
+                             font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"))
+        body = ctk.CTkLabel(card, text="", anchor="w", justify="left", text_color=SUBTEXT, wraplength=400,
+                            font=ctk.CTkFont(family="Segoe UI", size=11))
+        title.grid(row=0, column=0, sticky="w", padx=(14, 4), pady=(8, 0))
+        count.grid(row=0, column=1, sticky="e", padx=(4, 14), pady=(8, 0))
+        body.grid(row=1, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 9))
+        self.tr(title, lambda p=name: L(*p))
+        self.tr(body, lambda p=desc: L(*p))
+        self.tr(count, lambda n=len(steps): L(f"{n} ขั้นตอน", f"{n} steps"))
+
+        def on_resize(e, label=body):
+            w = max(e.width - 32, 160)
+            if abs(w - int(label.cget("wraplength"))) > 4:
+                label.configure(wraplength=w)
+
+        card.bind("<Configure>", on_resize)
+        for w in (card, title, body, count):
+            w.bind("<Button-1>", lambda _e, k=key: self._select_boost_profile(k))
+            try:
+                w.configure(cursor="hand2")
+            except Exception:
+                pass
+        self._boost_cards[key] = card
+
+    def _boost_reset_view(self):
+        """กลับสู่หน้าจอพร้อมใช้งาน (ล้างผลสรุป รีเซ็ตปุ่มวงกลม)"""
+        self._boost_summary_data = None
+        self._boost_ui = {"mode": "idle", "idx": 0, "total": 0, "name": ""}
+        self.boost_dial.state, self.boost_dial.progress, self.boost_dial.target = "idle", 0.0, 0.0
+
+    def _boost_back(self):
+        if self.busy:
+            return
+        self._boost_reset_view()
+        self._refresh_boost_texts()
+
+    def _show_boost_panel(self, which: str):
+        if which == "summary":
+            self._boost_cards_wrap.grid_remove()
+            self.boost_summary.grid()
+        else:
+            self.boost_summary.grid_remove()
+            self._boost_cards_wrap.grid()
+
+    def _apply_profile_style(self):
+        for key, card in self._boost_cards.items():
+            if key == self.boost_profile:
+                card.configure(border_color=BOOST, fg_color="#0E2A24")
+            else:
+                card.configure(border_color=CARD_BORDER, fg_color=BADGE_BG)
+
+    def _select_boost_profile(self, key):
+        if self.busy or key == self.boost_profile:
+            return
+        self.boost_profile = key
+        data = load_settings()
+        data["boost_profile"] = key
+        save_settings(data)
+        self._boost_reset_view()
+        self._apply_profile_style()
+        self._render_boost_steps()
+        self._refresh_boost_texts()
+
+    # สถานะของแต่ละขั้นตอน: (ไอคอน, สีตัวอักษร, สีพื้น)
+    _STEP_STYLE = {
+        "pending": ("○", SUBTEXT, BADGE_BG),
+        "run": ("◉", "#34D399", "#10281F"),
+        "ok": ("✓", "#34D399", BADGE_BG),
+        "warn": ("!", "#FBBF24", BADGE_BG),
+        "fail": ("✕", "#F87171", BADGE_BG),
+    }
+
+    def _render_boost_steps(self):
+        for w in self.boost_steps_frame.winfo_children():
+            w.destroy()
+        self._boost_rows = {}
+        self._boost_status = {}
+        for i, step in enumerate(BOOST_PROFILE_MAP[self.boost_profile][3]):
+            lbl = ctk.CTkLabel(self.boost_steps_frame, text="", anchor="w", height=30, corner_radius=8,
+                               font=ctk.CTkFont(family="Segoe UI", size=12))
+            lbl.grid(row=i // 2, column=i % 2, sticky="ew", padx=3, pady=3)
+            self._boost_rows[step] = lbl
+            self._set_step_row(step, "pending")
+
+    def _set_step_row(self, step, status):
+        self._boost_status[step] = status
+        lbl = self._boost_rows.get(step)
+        if lbl is None:
+            return
+        icon, fg, bg = self._STEP_STYLE[status]
+        lbl.configure(text=f"  {icon}   {L(*BOOST_STEPS[step][0])}", text_color=fg, fg_color=bg)
+
+    def _refresh_boost_texts(self):
+        """อัปเดตข้อความของหน้า Boost ตามภาษาและสถานะปัจจุบัน"""
+        ui = self._boost_ui
+        prof = BOOST_PROFILE_MAP[self.boost_profile]
+        if ui["mode"] == "run":
+            self.boost_status.configure(
+                text=L(f"ขั้นตอน {ui['idx'] + 1}/{ui['total']}: {ui['name']}",
+                       f"Step {ui['idx'] + 1}/{ui['total']}: {ui['name']}"), text_color="#34D399")
+            self.boost_hint.configure(text=L("กำลังทำงาน กรุณาอย่าปิดโปรแกรม", "Working, please keep the app open"))
+        elif ui["mode"] == "done":
+            self.boost_status.configure(text=L("บูสต์เสร็จสมบูรณ์", "Boost complete"), text_color="#34D399")
+            self.boost_hint.configure(text=L("กดปุ่มวงกลมอีกครั้งเพื่อรันซ้ำ หรือเลือกโปรไฟล์อื่นทางขวา",
+                                             "Press the dial to run again, or choose another profile"))
+        else:
+            self.boost_status.configure(
+                text=L(f"พร้อมบูสต์ ({len(prof[3])} ขั้นตอน)", f"Ready to boost ({len(prof[3])} steps)"),
+                text_color=TEXT)
+            self.boost_hint.configure(text=L("กดปุ่มวงกลมเพื่อเริ่มบูสต์", "Press the dial to start boosting"))
+        for step in self._boost_rows:
+            self._set_step_row(step, self._boost_status.get(step, "pending"))
+        self._render_boost_summary()
+        self._update_boost_last()
+
+    def _update_boost_last(self):
+        last = load_settings().get("boost_last") or {}
         try:
-            if self.current_page == "boost":
-                if self.busy:
-                    self.btn_boost.configure(border_color=BOOST_BUSY)
-                else:
-                    self._pulse_t += 0.13
-                    k = (math.sin(self._pulse_t) + 1) / 2
-                    lo, hi = _hex_to_rgb("#047857"), _hex_to_rgb("#A7F3D0")
-                    self.btn_boost.configure(border_color=_rgb_to_hex(
-                        tuple(a + (b - a) * k for a, b in zip(lo, hi))))
+            pname = BOOST_PROFILE_MAP.get(last.get("profile"), BOOST_PROFILE_MAP[BOOST_DEFAULT_PROFILE])[1]
+            self.boost_last.configure(text=L(
+                f"ครั้งล่าสุด: {last['time']} · โปรไฟล์ {pname[0]} · ล้างได้ {fmt_bytes(last['freed'])}",
+                f"Last run: {last['time']} · {pname[1]} profile · freed {fmt_bytes(last['freed'])}"))
+        except (KeyError, TypeError, ValueError):
+            self.boost_last.configure(text=L("ยังไม่เคยรัน", "Not run yet"))
+
+    @staticmethod
+    def _fmt_elapsed(sec: float) -> str:
+        sec = int(sec)
+        return f"{sec} s" if sec < 60 else f"{sec // 60}m {sec % 60:02d}s"
+
+    def _render_boost_summary(self):
+        p = self._boost_summary_data
+        if not p or self._boost_ui["mode"] != "done":
+            self._show_boost_panel("cards")
+            return
+        vals = (self._fmt_elapsed(p["elapsed"]), fmt_bytes(p["freed"]), fmt_bytes(p["ram"]),
+                f"{p['ok'] + p['warn']}/{p['total']}")
+        for lbl, v in zip(self._sum_tiles, vals):
+            lbl.configure(text=v)
+        self._sum_title.configure(text_color="#FBBF24" if (p["fail"] or p["warn"]) else BOOST)
+        if p["restart"]:
+            self._sum_restart.grid(row=3, column=0, columnspan=2, sticky="ew", padx=14, pady=(4, 2))
+        else:
+            self._sum_restart.grid_remove()
+        self._show_boost_panel("summary")
+
+    def _on_boost_event(self, p):
+        ev = p.get("ev")
+        if ev == "start":
+            self._boost_summary_data = None
+            for step in self._boost_rows:
+                self._set_step_row(step, "pending")
+            self._boost_ui = {"mode": "run", "idx": 0, "total": p["total"], "name": ""}
+            self.boost_dial.begin()
+            self._render_boost_summary()
+            try:
+                self.pages["boost"]._parent_canvas.yview_moveto(0)
+            except Exception:
+                pass
+        elif ev == "step":
+            idx, total, status = p["index"], self._boost_ui["total"] or 1, p["status"]
+            self._set_step_row(p["key"], status)
+            if status == "run":
+                self._boost_ui.update(mode="run", idx=idx, name=p["name"])
+                self.boost_dial.set_target((idx + 0.5) / total)
+            else:
+                self.boost_dial.set_target((idx + 1) / total)
+            self._refresh_boost_texts()
+        elif ev == "done":
+            self._boost_ui["mode"] = "done"
+            self._boost_summary_data = p
+            self.boost_dial.finish()
+            data = load_settings()
+            data["boost_last"] = {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "profile": p["profile"],
+                                  "freed": int(p["freed"]), "ok": p["ok"] + p["warn"], "total": p["total"]}
+            save_settings(data)
+            self._refresh_boost_texts()
+
+    def restart_now(self):
+        if not messagebox.askyesno(
+            APP_NAME,
+            L("รีสตาร์ทเครื่องตอนนี้หรือไม่?\n\nกรุณาบันทึกงานที่เปิดอยู่ก่อน เครื่องจะรีสตาร์ทใน 15 วินาที",
+              "Restart the PC now?\n\nSave your work first. The PC will restart in 15 seconds."),
+        ):
+            return
+        try:
+            subprocess.Popen(["shutdown", "/r", "/t", "15", "/c", "AZSIE Tweaker"], creationflags=CREATE_NO_WINDOW)
+            self.log(L("สั่งรีสตาร์ทใน 15 วินาที (ยกเลิกได้ด้วยคำสั่ง shutdown /a)",
+                       "Restart scheduled in 15 seconds (cancel with the command shutdown /a)"), "warn")
+        except OSError as e:
+            self.log(L(f"สั่งรีสตาร์ทไม่สำเร็จ: {e}", f"Could not schedule the restart: {e}"), "err")
+
+    def _pulse_boost(self):
+        # ขับแอนิเมชันของปุ่มวงกลม (ทำงานเฉพาะตอนเปิดหน้า Boost)
+        now = time.time()
+        dt = now - self._boost_last_tick
+        self._boost_last_tick = now
+        try:
+            if self.current_page == "boost" and self.winfo_viewable():
+                self.boost_dial.tick(dt)
         except Exception:
             pass
-        self.after(50, self._pulse_boost)
+        self.after(45, self._pulse_boost)
 
     # ---- Download counter --------------------------------------------
     def _load_dl_cache(self):
@@ -1629,6 +2290,8 @@ class AzsieTweaker(ctk.CTk):
     # Logging (thread-safe through queue)
     # ------------------------------------------------------------------
     def log(self, text: str, level: str = "info"):
+        if level == "err" and self._boost_tracking:
+            self._boost_err = True
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_q.put(("log", (stamp, LOG_PREFIX.get(level, "") + text, level)))
 
@@ -1652,6 +2315,8 @@ class AzsieTweaker(ctk.CTk):
                     self._set_busy(False)
                 elif kind == "update":
                     self._on_update_result(payload)
+                elif kind == "boost":
+                    self._on_boost_event(payload)
                 elif kind == "dl":
                     self._dl.update(payload)
                     if payload.get("total") is not None:
@@ -1678,10 +2343,8 @@ class AzsieTweaker(ctk.CTk):
         state = "disabled" if busy else "normal"
         for b in self.action_buttons:
             b.configure(state=state)
-        if busy:
-            self.btn_boost.set_palette(BOOST_BUSY, BOOST_BUSY)
-        else:
-            self.btn_boost.set_palette(BOOST, BOOST_HOVER)
+        if not busy:  # ปุ่มวงกลมเข้าสู่โหมดทำงานจากอีเวนต์ "start" ของ Boost เท่านั้น (ไม่ใช่งานอื่น)
+            self.boost_dial.set_busy(False)
         if busy:
             self.progress.start()
         else:
@@ -1715,18 +2378,19 @@ class AzsieTweaker(ctk.CTk):
         if self.busy:
             self.log(L("มีงานกำลังทำอยู่ กรุณารอให้เสร็จก่อน", "A task is already running, please wait"), "warn")
             return
+        key, name, desc, steps = BOOST_PROFILE_MAP[self.boost_profile]
+        names = [L(*BOOST_STEPS[k][0]) for k in steps]
+        lines = [", ".join(names[i:i + 3]) for i in range(0, len(names), 3)]
+        listing = "\n".join("- " + ln for ln in lines)
         if messagebox.askyesno(
             APP_NAME,
-            L("ต้องการรัน ULTIMATE BOOST ทั้งหมดหรือไม่?\n\n"
-              "- ลบไฟล์ขยะและแคช / ล้าง RAM\n- รีเซ็ตเครือข่าย (ต้องรีสตาร์ท)\n"
-              "- ปิด Telemetry, Game Bar/DVR, HPET\n- เปิด Ultimate Performance\n\n"
-              "ระบบจะสร้างจุดคืนค่าระบบให้ก่อนเริ่ม",
-              "Run the full ULTIMATE BOOST?\n\n"
-              "- Delete junk files and caches / free RAM\n- Reset network (restart required)\n"
-              "- Disable Telemetry, Game Bar/DVR, HPET\n- Enable Ultimate Performance\n\n"
-              "A restore point will be created first"),
+            L(f"รัน ONE-CLICK BOOST โปรไฟล์ \"{name[0]}\" ({len(steps)} ขั้นตอน) หรือไม่?\n\n{L(*desc)}\n\n"
+              f"{listing}\n\nระบบจะสร้างจุดคืนค่าระบบให้ก่อนเริ่ม",
+              f"Run ONE-CLICK BOOST with the \"{name[1]}\" profile ({len(steps)} steps)?\n\n{L(*desc)}\n\n"
+              f"{listing}\n\nA restore point will be created first"),
         ):
-            self.run_task(("ULTIMATE BOOST", "ULTIMATE BOOST"), self.task_ultimate_boost)
+            self.run_task((f"ONE-CLICK BOOST ({name[0]})", f"ONE-CLICK BOOST ({name[1]})"),
+                          lambda k=key: self.task_boost(k))
 
     # ------------------------------------------------------------------
     # Command helpers
@@ -1795,6 +2459,7 @@ class AzsieTweaker(ctk.CTk):
             except OSError:
                 skipped += 1
         freed = max(before - dir_size(path), 0)
+        self._freed_total += freed
         if verbose:
             self.log(L(f"ลบแล้ว {fmt_bytes(freed)} (ข้าม {skipped} รายการที่ถูกใช้งานอยู่)",
                        f"Freed {fmt_bytes(freed)} (skipped {skipped} items in use)"), "ok")
@@ -1811,6 +2476,7 @@ class AzsieTweaker(ctk.CTk):
                 deleted += 1
             except OSError:
                 skipped += 1
+        self._freed_total += freed
         return freed, deleted, skipped
 
     # ------------------------------------------------------------------
@@ -2390,34 +3056,246 @@ class AzsieTweaker(ctk.CTk):
                    f"Removed {removed} update-blocking polic(ies) and restored the services (restart once)"), "ok")
 
     # ------------------------------------------------------------------
+    # TASKS - เพิ่มเติม (ล้างแคช / ปรับแต่งประสิทธิภาพ / ความเป็นส่วนตัว)
+    # ------------------------------------------------------------------
+    def task_shader_cache(self):
+        local = os.environ.get("LOCALAPPDATA", "")
+        pdata = os.environ.get("ProgramData", r"C:\ProgramData")
+        dirs = [os.path.join(pdata, "NVIDIA Corporation", "NV_Cache")]
+        if local:
+            dirs += [os.path.join(local, p) for p in (
+                "D3DSCache", r"NVIDIA\DXCache", r"NVIDIA\GLCache", r"AMD\DxCache", r"AMD\DxcCache",
+                r"AMD\GLCache", r"Intel\ShaderCache")]
+        total = found = 0
+        for d in dirs:
+            if os.path.isdir(d):
+                found += 1
+                total += self._clean_dir(d)
+        if not found:
+            self.log(L("ไม่พบแคช Shader ในเครื่องนี้", "No shader caches found on this PC"), "info")
+            return
+        self.log(L(f"รวมล้างแคช Shader ได้ {fmt_bytes(total)}", f"Total shader cache removed: {fmt_bytes(total)}"), "ok")
+        self.log(L("เกมจะสร้างแคชใหม่เองตอนเปิดครั้งถัดไป อาจกระตุกเล็กน้อยในครั้งแรก",
+                   "Games rebuild their caches on next launch; the first run may stutter slightly"), "info")
+
+    def task_sys_logs(self):
+        win = os.environ.get("SystemRoot", r"C:\Windows")
+        total = 0
+        for d in (os.path.join(win, "Logs", "CBS"), os.path.join(win, "Logs", "DISM"),
+                  os.path.join(win, "Logs", "WindowsUpdate"),
+                  os.path.join(win, "SoftwareDistribution", "DeliveryOptimization"),
+                  os.path.join(win, "ServiceProfiles", "NetworkService", "AppData", "Local", "Microsoft",
+                               "Windows", "DeliveryOptimization", "Cache")):
+            if os.path.isdir(d):
+                total += self._clean_dir(d)
+        self.log(L(f"รวมล้างบันทึกระบบและแคชได้ {fmt_bytes(total)}", f"Total logs and cache removed: {fmt_bytes(total)}"), "ok")
+
+    def task_retrim(self):
+        script = (
+            '$ErrorActionPreference="Stop"; '
+            '$dl=$env:SystemDrive.TrimEnd(":"); '
+            '$m=(Get-Partition -DriveLetter $dl | Get-Disk | Get-PhysicalDisk | Select-Object -First 1).MediaType; '
+            'if($m -eq "SSD"){Optimize-Volume -DriveLetter $dl -ReTrim; Write-Output "TRIM_OK"} '
+            'else {Write-Output "NOT_SSD"}'
+        )
+        code, out = self.run_ps(script, timeout=1800)
+        if "TRIM_OK" in out:
+            self.log(L("สั่ง TRIM ไดรฟ์ระบบ (SSD) เรียบร้อย", "TRIM completed on the system drive (SSD)"), "ok")
+        elif "NOT_SSD" in out:
+            self.log(L("ไดรฟ์ระบบไม่ใช่ SSD (หรือตรวจชนิดไม่ได้) - ข้าม TRIM", "System drive is not an SSD (or its type is unknown) - TRIM skipped"), "info")
+        else:
+            self.log(L("สั่ง TRIM ไม่สำเร็จ", "Could not run TRIM"), "err")
+
+    def task_power_throttle(self):
+        ok, fail = self._reg_apply([(HKLM, r"SYSTEM\CurrentControlSet\Control\Power\PowerThrottling",
+                                     "PowerThrottlingOff", 1)])
+        self._log_applied(ok, fail)
+        if ok:
+            self.log(L("ปิด Power Throttling แล้ว (ต้องรีสตาร์ทเครื่อง)", "Power Throttling disabled (restart required)"), "ok")
+
+    def task_priority_sep(self):
+        ok, fail = self._reg_apply([(HKLM, r"SYSTEM\CurrentControlSet\Control\PriorityControl",
+                                     "Win32PrioritySeparation", 0x26)])
+        self._log_applied(ok, fail)
+        if ok:
+            self.log(L("ตั้ง Win32PrioritySeparation = 0x26 แล้ว (ต้องรีสตาร์ทเครื่อง)",
+                       "Win32PrioritySeparation set to 0x26 (restart required)"), "ok")
+
+    def task_mmcss_games(self):
+        path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"
+        ok, fail = self._reg_apply([
+            (HKLM, path, "GPU Priority", 8),
+            (HKLM, path, "Priority", 6),
+            (HKLM, path, "Scheduling Category", "High"),
+            (HKLM, path, "SFIO Priority", "High"),
+        ])
+        self._log_applied(ok, fail)
+        if ok:
+            self.log(L("ปรับโปรไฟล์ MMCSS สำหรับเกมแล้ว (ต้องรีสตาร์ทเครื่อง)", "MMCSS game profile tuned (restart required)"), "ok")
+
+    def task_nagle(self):
+        base = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+        try:
+            with winreg.OpenKey(HKLM, base, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+                guids = [winreg.EnumKey(k, i) for i in range(winreg.QueryInfoKey(k)[0])]
+        except OSError as e:
+            self.log(L(f"อ่านรายการการ์ดเครือข่ายไม่ได้: {e}", f"Could not read the network adapter list: {e}"), "err")
+            return
+
+        def has_ip(path):
+            for name in ("DhcpIPAddress", "IPAddress"):
+                v = reg_read(HKLM, path, name)
+                for x in (v if isinstance(v, (list, tuple)) else [v]):
+                    if x and x != "0.0.0.0":
+                        return True
+            return False
+
+        items, adapters = [], 0
+        for g in guids:
+            path = base + "\\" + g
+            if has_ip(path):
+                adapters += 1
+                items += [(HKLM, path, "TcpAckFrequency", 1), (HKLM, path, "TCPNoDelay", 1)]
+        if not adapters:
+            self.log(L("ไม่พบการ์ดเครือข่ายที่มี IP - ข้าม", "No network adapter with an IP address found - skipped"), "warn")
+            return
+        ok, fail = self._reg_apply(items)
+        self._log_applied(ok, fail)
+        self.log(L(f"ปิด Nagle Algorithm กับการ์ดเครือข่าย {adapters} ตัวแล้ว (ต้องรีสตาร์ทเครื่อง)",
+                   f"Nagle's algorithm disabled on {adapters} adapter(s) (restart required)"), "ok")
+
+    def task_game_mode(self):
+        path = r"Software\Microsoft\GameBar"
+        ok, fail = self._reg_apply([(HKCU, path, "AutoGameModeEnabled", 1), (HKCU, path, "AllowAutoGameMode", 1)])
+        self._log_applied(ok, fail)
+        if ok:
+            self.log(L("เปิด Game Mode แล้ว", "Game Mode enabled"), "ok")
+
+    def task_ui_delay(self):
+        ok, fail = self._reg_apply([
+            (HKCU, r"Control Panel\Desktop", "MenuShowDelay", "0"),
+            (HKCU, r"Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize", "StartupDelayInMSec", 0),
+        ])
+        self._log_applied(ok, fail)
+        if ok:
+            self.log(L("ลดความหน่วงเมนูและ Startup delay แล้ว (ออกจากระบบแล้วเข้าใหม่เพื่อให้มีผล)",
+                       "Menu delay and startup delay reduced (sign out and in for it to apply)"), "ok")
+
+    def task_fast_shutdown(self):
+        ok, fail = self._reg_apply([
+            (HKLM, r"SYSTEM\CurrentControlSet\Control", "WaitToKillServiceTimeout", "3000"),
+            (HKCU, r"Control Panel\Desktop", "WaitToKillAppTimeout", "5000"),
+            (HKCU, r"Control Panel\Desktop", "HungAppTimeout", "3000"),
+        ])
+        self._log_applied(ok, fail)
+        if ok:
+            self.log(L("ลดเวลารอตอนปิดเครื่องแล้ว", "Shutdown wait times reduced"), "ok")
+
+    def task_hibernate_off(self):
+        code, _ = self.run_cmd(["powercfg", "/h", "off"])
+        if code == 0:
+            self.log(L("ปิด Hibernate และลบ hiberfil.sys แล้ว", "Hibernate disabled and hiberfil.sys removed"), "ok")
+        else:
+            self.log(L("ปิด Hibernate ไม่สำเร็จ", "Could not disable Hibernate"), "err")
+
+    def task_hibernate_on(self):
+        code, _ = self.run_cmd(["powercfg", "/h", "on"])
+        if code == 0:
+            self.log(L("เปิด Hibernate กลับแล้ว", "Hibernate re-enabled"), "ok")
+        else:
+            self.log(L("เปิด Hibernate ไม่สำเร็จ (เครื่องบางรุ่นไม่รองรับ)", "Could not enable Hibernate (not supported on some PCs)"), "err")
+
+    def task_activity_history(self):
+        pol = r"SOFTWARE\Policies\Microsoft\Windows\System"
+        ok, fail = self._reg_apply([
+            (HKLM, pol, "EnableActivityFeed", 0),
+            (HKLM, pol, "PublishUserActivities", 0),
+            (HKLM, pol, "UploadUserActivities", 0),
+            (HKCU, r"Control Panel\International\User Profile", "HttpAcceptLanguageOptOut", 1),
+        ])
+        self._log_applied(ok, fail)
+        if ok:
+            self.log(L("ปิด Activity History และการติดตามภาษาแล้ว", "Activity History and language tracking turned off"), "ok")
+
+    def task_bing_search(self):
+        ok, fail = self._reg_apply([
+            (HKCU, r"Software\Microsoft\Windows\CurrentVersion\Search", "BingSearchEnabled", 0),
+            (HKCU, r"Software\Microsoft\Windows\CurrentVersion\Search", "CortanaConsent", 0),
+            (HKCU, r"Software\Policies\Microsoft\Windows\Explorer", "DisableSearchBoxSuggestions", 1),
+        ])
+        self._log_applied(ok, fail)
+        if ok:
+            self.log(L("ปิดการค้นหาเว็บใน Start Menu แล้ว (ออกจากระบบแล้วเข้าใหม่เพื่อให้มีผล)",
+                       "Web search in the Start Menu turned off (sign out and in for it to apply)"), "ok")
+
+    def task_bg_apps(self):
+        ok, fail = self._reg_apply([
+            (HKCU, r"Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications", "GlobalUserDisabled", 1),
+            (HKCU, r"Software\Microsoft\Windows\CurrentVersion\Search", "BackgroundAppGlobalToggle", 0),
+        ])
+        self._log_applied(ok, fail)
+        if ok:
+            self.log(L("ปิดแอป Store ที่รันเบื้องหลังแล้ว", "Store apps running in the background turned off"), "ok")
+
+    # ------------------------------------------------------------------
     # One-click boost
     # ------------------------------------------------------------------
-    def task_ultimate_boost(self):
-        steps = [
-            (("จุดคืนค่าระบบ", "System Restore Point"), self.task_restore_point),
-            (("ล้างไฟล์ขยะ", "Junk Files"), self.task_clean_junk),
-            (("ล้างแคช Windows Update", "Windows Update Cache"), self.task_update_cache),
-            (("ล้างแคชเบราว์เซอร์", "Browser Caches"), self.task_browser_cache),
-            (("ล้างแคชรูปย่อและไอคอน", "Thumbnail & Icon Cache"), self.task_thumbnails),
-            (("ล้าง Crash Dump", "Crash Dumps"), self.task_crash_dumps),
-            (("ล้างถังขยะ", "Recycle Bin"), self.task_recycle_bin),
-            (("ล้างแคช RAM", "RAM Cache"), self.task_optimize_ram),
-            (("รีเซ็ตเครือข่าย", "Network Reset"), self.task_network),
-            (("Ultimate Performance", "Ultimate Performance"), self.task_ultimate_power),
-            (("ปิด Telemetry", "Disable Telemetry"), self.task_telemetry),
-            (("ปิด Game Bar และ DVR", "Disable Game Bar & DVR"), self.task_gamebar),
-            (("ปิด HPET", "Disable HPET"), self.task_hpet),
-        ]
-        total = len(steps)
-        for i, (pair, fn) in enumerate(steps, 1):
+    def _boost_post(self, **payload):
+        self.log_q.put(("boost", payload))
+
+    def task_boost(self, profile: str = BOOST_DEFAULT_PROFILE):
+        key, pname, _desc, step_keys = BOOST_PROFILE_MAP.get(profile) or BOOST_PROFILE_MAP[BOOST_DEFAULT_PROFILE]
+        total = len(step_keys)
+        t0 = time.time()
+        self._freed_total = 0
+        try:
+            ram_before = psutil.virtual_memory().available
+        except Exception:  # noqa: BLE001
+            ram_before = 0
+        counts = {"ok": 0, "warn": 0, "fail": 0}
+        needs_restart = False
+        self.log(L(f"โปรไฟล์: {pname[0]} ({total} ขั้นตอน)", f"Profile: {pname[1]} ({total} steps)"), "run")
+        self._boost_post(ev="start", total=total)
+        for i, step in enumerate(step_keys):
+            pair, method = BOOST_STEPS[step]
             name = L(*pair)
-            self.log(f"-------- [{i}/{total}] {name} --------", "run")
+            self.log(f"-------- [{i + 1}/{total}] {name} --------", "run")
+            self._boost_post(ev="step", index=i, key=step, status="run", name=name)
+            self._boost_err = False
+            self._boost_tracking = True
+            status = "ok"
             try:
-                fn()
+                getattr(self, method)()
+                if self._boost_err:
+                    status = "warn"
             except Exception as e:  # noqa: BLE001
+                status = "fail"
                 self.log(L(f"ขั้นตอน {name} ผิดพลาด: {e}", f"Step {name} failed: {e}"), "err")
-        self.log(L("ULTIMATE BOOST เสร็จสมบูรณ์ กรุณารีสตาร์ทเครื่อง 1 ครั้ง",
-                   "ULTIMATE BOOST complete. Please restart your PC once"), "ok")
+            finally:
+                self._boost_tracking = False
+            counts[status] += 1
+            if step in BOOST_NEEDS_RESTART and status != "fail":
+                needs_restart = True
+            self._boost_post(ev="step", index=i, key=step, status=status, name=name)
+        try:
+            ram_gain = max(psutil.virtual_memory().available - ram_before, 0)
+        except Exception:  # noqa: BLE001
+            ram_gain = 0
+        elapsed = time.time() - t0
+        self._boost_post(ev="done", profile=key, total=total, ok=counts["ok"], warn=counts["warn"],
+                         fail=counts["fail"], elapsed=elapsed, freed=self._freed_total, ram=ram_gain,
+                         restart=needs_restart)
+        summary = L(f"สำเร็จ {counts['ok'] + counts['warn']}/{total} ขั้นตอน ใช้เวลา {int(elapsed)} วินาที "
+                    f"ล้างได้ {fmt_bytes(self._freed_total)}",
+                    f"{counts['ok'] + counts['warn']}/{total} steps done in {int(elapsed)} s, "
+                    f"freed {fmt_bytes(self._freed_total)}")
+        self.log(L("บูสต์เสร็จสมบูรณ์: ", "Boost complete: ") + summary, "ok" if not counts["fail"] else "warn")
+        if needs_restart:
+            self.log(L("กรุณารีสตาร์ทเครื่อง 1 ครั้งเพื่อให้การปรับแต่งมีผลครบ",
+                       "Please restart your PC once so every change takes full effect"), "warn")
+
+    def task_ultimate_boost(self):
+        self.task_boost("full")
 
 
 # ======================================================================
