@@ -15,7 +15,7 @@ pip install customtkinter psutil pillow
 SIDEBAR_SIDE = "right"   # "right" = เมนูชิดขวา, "left" = เมนูชิดซ้าย
 
 APP_NAME = "AZSIE TWEAKER TOOL"
-APP_VERSION = "1.10"
+APP_VERSION = "1.01"
 RESTORE_POINT_NAME = "AZSIE Tweaker Restore Point"
 
 # ลิงก์ Discord ที่แสดงในหน้า Info
@@ -53,6 +53,7 @@ import urllib.error
 import urllib.request
 import winreg
 from datetime import datetime
+from PIL import Image
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
@@ -790,8 +791,11 @@ class AzsieTweaker(ctk.CTk):
         self._i18n = []
         self.current_page = "dashboard"
 
-        # No third-party logo is embedded; the text mark below avoids unclear image rights.
-        self.logo_img = None
+        try:
+            logo_path = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "azsie_logo.png")
+            self.logo_img = Image.open(logo_path).convert("RGBA")
+        except (OSError, ValueError):
+            self.logo_img = None
         self._set_window_icon()
 
         self.sys_drive = os.environ.get("SystemDrive", "C:")

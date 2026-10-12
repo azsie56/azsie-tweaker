@@ -4,7 +4,7 @@ Open-source Windows system tuning tool for users who understand system-level cha
 
 ## Release contents
 
-- The unverified embedded Base64 logo was removed; the app uses the AZSIE text mark.
+- The supplied AZSIE logo is included as `azsie_logo.png` and used by the app and Windows EXE icon.
 - No private data is embedded. The Discord URL is public.
 - A visible disclaimer warns about system changes.
 - Released under GNU GPL v3. See `LICENSE`.
@@ -36,7 +36,7 @@ python azsie_tweakers.py
 
 Some actions require Administrator privileges.
 
-The app uses GitHub only for optional update checks and download statistics. The configured repository is `azsie56/azsie-tweaker`.
+The app uses GitHub only for optional update checks and download statistics. The configured repository is `azsie56/azsie-tweaker`. The current app version is `1.01`.
 
 ## SHA256 checksums for releases
 
